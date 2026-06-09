@@ -21,7 +21,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray, new_null_array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, FieldRef, TimeUnit};
@@ -966,6 +966,19 @@ pub(crate) fn create_primitive_array_repeated(
             ))
         }
         (DataType::Null, _) => Arc::new(arrow_array::NullArray::new(num_rows)),
+        // Nested types (list / large-list / map / fixed-size-list) for a column that is absent
+        // from the data file (schema evolution added it after the file was written). There is no
+        // primitive default to repeat, so emit an all-NULL array of exactly the target type.
+        // new_null_array preserves the nested Field definitions (incl. field-id metadata), so the
+        // result matches the target schema. Note the Struct(None) arm above recurses through
+        // create_primitive_array_repeated, so a struct containing maps/lists is handled too.
+        (
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Map(_, _)
+            | DataType::FixedSizeList(_, _),
+            None,
+        ) => new_null_array(data_type, num_rows),
         (dt, _) => {
             return Err(Error::new(
                 ErrorKind::Unexpected,
@@ -991,6 +1004,59 @@ mod test {
 
     use super::*;
     use crate::spec::{ListType, Literal, MapType, NestedField, PrimitiveType, StructType, Type};
+
+    /// Regression: a `map<string,double>` (stored as `List(Struct{key,value})`) that is absent
+    /// from a data file (schema evolution added it later) must materialize as an all-NULL column
+    /// of the target nested type. Before the fix, `create_primitive_array_repeated` had no arm for
+    /// List/Map and returned `Err("unexpected target column type List(...)")`. Matches
+    /// iceberg-java's `BaseParquetReaders.defaultReader` (absent + optional -> `nulls()`).
+    #[test]
+    fn create_repeated_null_for_absent_nested_columns() {
+        let key = Field::new("key", DataType::Utf8, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "101".to_string(),
+        )]));
+        let value = Field::new("value", DataType::Float64, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "102".to_string(),
+        )]));
+        let element = Field::new(
+            "element",
+            DataType::Struct(Fields::from(vec![key, value])),
+            true,
+        );
+        let map_as_list = DataType::List(Arc::new(element));
+
+        // absent map column -> all-null ListArray of exactly this type
+        let arr = create_primitive_array_repeated(&map_as_list, &None, 4).unwrap();
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.null_count(), 4);
+        assert_eq!(arr.data_type(), &map_as_list);
+
+        // a struct CONTAINING such a list (the Struct(None) arm recurses) is also handled
+        let outer = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("m", map_as_list.clone(), true),
+        ]));
+        let s = create_primitive_array_repeated(&outer, &None, 3).unwrap();
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.data_type(), &outer);
+
+        // arrow-native Map type as well
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Float64, true),
+            ])),
+            false,
+        );
+        let map_ty = DataType::Map(Arc::new(entries), false);
+        let m = create_primitive_array_repeated(&map_ty, &None, 5).unwrap();
+        assert_eq!(m.len(), 5);
+        assert_eq!(m.null_count(), 5);
+        assert_eq!(m.data_type(), &map_ty);
+    }
 
     #[test]
     fn test_arrow_struct_to_iceberg_struct() {
