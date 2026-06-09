@@ -18,8 +18,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    Array as ArrowArray, ArrayRef, Int32Array, LargeListArray, ListArray, MapArray, RecordBatch,
+    RecordBatchOptions, RunArray, StructArray, new_null_array,
 };
 use arrow_cast::cast;
 use arrow_schema::{
@@ -610,7 +612,7 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => cast(&*columns[*source_index], target_type)?,
+                    } => promote_array_to_target(&columns[*source_index], target_type)?,
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
@@ -619,6 +621,133 @@ impl RecordBatchTransformer {
             })
             .collect()
     }
+}
+
+/// Look up an Iceberg field id from an Arrow field's `PARQUET:field_id` metadata.
+fn arrow_field_id(field: &Field) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|s| s.parse::<i32>().ok())
+}
+
+/// Adapt a source array to a target Arrow type, matching nested fields by Iceberg field id.
+///
+/// `arrow_cast::cast` reconciles struct/list/map children **positionally**, which corrupts
+/// reads whenever a nested struct evolved (e.g. a field was added in the middle of a struct):
+/// the source struct has fewer children than the target, so every subsequent child shifts and
+/// the types no longer line up -- producing errors like "Casting from Utf8 to Struct".
+///
+/// This walks the target type recursively instead:
+///   * Struct: for each target child, find the source child with the same field id and recurse;
+///     children present in the target but absent from the source (added by schema evolution) are
+///     filled with all-NULL arrays of the target child type. Source-only children are dropped.
+///   * List / LargeList / Map: recurse into the element / key / value types, preserving the
+///     source offsets and validity (row count is unchanged).
+///   * Anything else (primitives): defer to `arrow_cast::cast` for valid Iceberg type promotions
+///     (int->long, float->double, decimal widening, etc.).
+///
+/// Mirrors iceberg-java, whose Parquet reader builds nested readers by field id and supplies NULLs
+/// for fields missing from a data file.
+fn promote_array_to_target(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef> {
+    match target_type {
+        DataType::Struct(target_children) => {
+            let source = array.as_struct_opt().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "expected a struct array to promote to {target_type:?}, got {:?}",
+                        array.data_type()
+                    ),
+                )
+            })?;
+
+            // field id -> source child column index
+            let mut source_by_id: HashMap<i32, usize> = HashMap::new();
+            for (idx, field) in source.fields().iter().enumerate() {
+                if let Some(id) = arrow_field_id(field) {
+                    source_by_id.insert(id, idx);
+                }
+            }
+
+            let len = source.len();
+            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(target_children.len());
+            for target_child in target_children.iter() {
+                let matched = arrow_field_id(target_child)
+                    .and_then(|id| source_by_id.get(&id))
+                    .copied();
+                match matched {
+                    Some(src_idx) => new_columns.push(promote_array_to_target(
+                        source.column(src_idx),
+                        target_child.data_type(),
+                    )?),
+                    // Field added by schema evolution after this file was written -> all NULLs.
+                    None => new_columns.push(new_null_array(target_child.data_type(), len)),
+                }
+            }
+
+            Ok(Arc::new(StructArray::new(
+                target_children.clone(),
+                new_columns,
+                source.nulls().cloned(),
+            )))
+        }
+        DataType::List(target_element) => {
+            let source = array.as_list_opt::<i32>().ok_or_else(|| list_err(array, target_type))?;
+            let values = promote_array_to_target(source.values(), target_element.data_type())?;
+            Ok(Arc::new(ListArray::new(
+                target_element.clone(),
+                source.offsets().clone(),
+                values,
+                source.nulls().cloned(),
+            )))
+        }
+        DataType::LargeList(target_element) => {
+            let source = array
+                .as_list_opt::<i64>()
+                .ok_or_else(|| list_err(array, target_type))?;
+            let values = promote_array_to_target(source.values(), target_element.data_type())?;
+            Ok(Arc::new(LargeListArray::new(
+                target_element.clone(),
+                source.offsets().clone(),
+                values,
+                source.nulls().cloned(),
+            )))
+        }
+        DataType::Map(target_entries, sorted) => {
+            let source = array
+                .as_map_opt()
+                .ok_or_else(|| list_err(array, target_type))?;
+            // The map's entries are a (non-nullable) struct of {key, value}; reconcile it by id.
+            let entries = promote_array_to_target(
+                &(Arc::new(source.entries().clone()) as ArrayRef),
+                target_entries.data_type(),
+            )?;
+            let entries_struct = entries.as_struct().clone();
+            Ok(Arc::new(MapArray::new(
+                target_entries.clone(),
+                source.offsets().clone(),
+                entries_struct,
+                source.nulls().cloned(),
+                *sorted,
+            )))
+        }
+        // Primitive (and other leaf) types: standard Iceberg type promotion.
+        _ => Ok(cast(array.as_ref(), target_type)?),
+    }
+}
+
+fn list_err(array: &ArrayRef, target_type: &DataType) -> Error {
+    Error::new(
+        ErrorKind::Unexpected,
+        format!(
+            "expected a list/map array to promote to {target_type:?}, got {:?}",
+            array.data_type()
+        ),
+    )
+}
+
+impl RecordBatchTransformer {
 
     fn create_column(
         target_type: &DataType,
@@ -671,9 +800,119 @@ mod test {
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use crate::arrow::record_batch_transformer::{
-        RecordBatchTransformer, RecordBatchTransformerBuilder,
+        RecordBatchTransformer, RecordBatchTransformerBuilder, promote_array_to_target,
     };
     use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
+
+    fn with_id(field: Field, id: i32) -> Field {
+        field.with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    /// Regression for nested-struct schema evolution: a struct gained a field in the middle
+    /// after a data file was written. `arrow_cast::cast` matches struct children positionally,
+    /// so the trailing children shift and types collide. `promote_array_to_target` must instead
+    /// match by field id, preserving existing children and filling the added one with NULLs.
+    #[test]
+    fn promote_struct_fills_added_middle_field_by_id() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        use arrow_array::{ArrayRef, Int32Array, StringArray, StructArray};
+        use arrow_schema::Fields;
+
+        // SOURCE (old file): a(id=1,int), c(id=3,utf8) -- missing b(id=2).
+        let a = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let c = Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef;
+        let source = Arc::new(StructArray::new(
+            Fields::from(vec![
+                with_id(Field::new("a", DataType::Int32, true), 1),
+                with_id(Field::new("c", DataType::Utf8, true), 3),
+            ]),
+            vec![a, c],
+            None,
+        )) as ArrayRef;
+
+        // TARGET (current table): a(1), b(2,new), c(3).
+        let target = DataType::Struct(Fields::from(vec![
+            with_id(Field::new("a", DataType::Int32, true), 1),
+            with_id(Field::new("b", DataType::Int32, true), 2),
+            with_id(Field::new("c", DataType::Utf8, true), 3),
+        ]));
+
+        let out = promote_array_to_target(&source, &target).unwrap();
+        let s = out.as_struct();
+        assert_eq!(s.num_columns(), 3);
+        assert_eq!(s.column(0).as_primitive::<Int32Type>().values(), &[1, 2]);
+        assert_eq!(s.column(1).null_count(), 2, "added field b must be all NULL");
+        let cc = s.column(2).as_string::<i32>();
+        assert_eq!((cc.value(0), cc.value(1)), ("x", "y"), "c must not shift onto b");
+    }
+
+    /// Mirrors the production failure shape: a struct missing a scalar field that sits *before*
+    /// a `list<struct<..>>` child. Positional casting would line the list/struct child up against
+    /// the wrong target slot and fail with "Casting from Utf8 to Struct"; field-id matching fixes it.
+    #[test]
+    fn promote_struct_missing_field_before_nested_list_struct() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+        use arrow_schema::Fields;
+
+        // list<struct<x:int(id=5)>> element field
+        let elem_field = Arc::new(with_id(
+            Field::new(
+                "element",
+                DataType::Struct(Fields::from(vec![with_id(
+                    Field::new("x", DataType::Int32, true),
+                    5,
+                )])),
+                true,
+            ),
+            4,
+        ));
+        let inner_x = Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef;
+        let elem_struct = Arc::new(StructArray::new(
+            Fields::from(vec![with_id(Field::new("x", DataType::Int32, true), 5)]),
+            vec![inner_x],
+            None,
+        ));
+        let list = Arc::new(ListArray::new(
+            elem_field.clone(),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            elem_struct,
+            None,
+        )) as ArrayRef;
+
+        // SOURCE struct: s(id=1,utf8), ev(id=3,list<struct>) -- missing gap(id=2).
+        let s_col = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let source = Arc::new(StructArray::new(
+            Fields::from(vec![
+                with_id(Field::new("s", DataType::Utf8, true), 1),
+                with_id(Field::new("ev", DataType::List(elem_field.clone()), true), 3),
+            ]),
+            vec![s_col, list],
+            None,
+        )) as ArrayRef;
+
+        // TARGET: s(1), gap(2,new int), ev(3,list<struct>).
+        let target = DataType::Struct(Fields::from(vec![
+            with_id(Field::new("s", DataType::Utf8, true), 1),
+            with_id(Field::new("gap", DataType::Int32, true), 2),
+            with_id(Field::new("ev", DataType::List(elem_field), true), 3),
+        ]));
+
+        let out = promote_array_to_target(&source, &target).unwrap();
+        let st = out.as_struct();
+        assert_eq!(st.num_columns(), 3);
+        assert_eq!(st.column(1).null_count(), 2, "added gap must be NULL");
+        // ev preserved as a list<struct>, not corrupted
+        let ev = st.column(2).as_list::<i32>();
+        assert_eq!(ev.len(), 2);
+        let first = ev.value(0);
+        assert_eq!(first.as_struct().column(0).as_primitive::<arrow_array::types::Int32Type>().value(0), 10);
+    }
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
     /// Returns empty string for null values
