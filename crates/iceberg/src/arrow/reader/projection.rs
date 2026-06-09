@@ -438,6 +438,105 @@ mod tests {
     use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
     use crate::{ErrorKind, Runtime};
 
+    /// Reproduces the production over-read on PivotedCombinedTradeOptimized: that table writes
+    /// 1 GB row groups, so each ~1 GB data file is a SINGLE row group. Comet splits each file into
+    /// several byte-range splits (separate FileScanTasks with start/length). A single row group
+    /// spanning the whole file OVERLAPS every split's byte range, and
+    /// `filter_row_groups_by_byte_range` uses an overlap test -> every split selects that one row
+    /// group -> the file is read once PER SPLIT -> N x row duplication.
+    ///
+    /// Trivial schema here (file schema == task schema => PassThrough), so RecordBatchTransformer /
+    /// promote_array_to_target / create_primitive_array_repeated are NOT involved -- this isolates
+    /// the bug to split/row-group selection, independent of the nested-schema fixes.
+    #[tokio::test]
+    async fn split_read_must_not_duplicate_single_rowgroup() {
+        use arrow_array::Int64Array;
+
+        const N: i64 = 10_000;
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp = TempDir::new().unwrap();
+        let path = format!("{}/single_rg.parquet", tmp.path().to_str().unwrap());
+        // Force ALL rows into ONE row group (like the table's 1 GB row-group-size).
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(usize::MAX)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int64Array::from((0..N).collect::<Vec<_>>())) as ArrayRef,
+        ])
+        .unwrap();
+        w.write(&batch).unwrap();
+        let meta = w.close().unwrap();
+        assert_eq!(meta.row_groups().len(), 1, "test setup: expected a single row group");
+
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let file_io = FileIO::new_with_fs();
+
+        // Split the file into K adjacent byte ranges, exactly as Comet splits a large file.
+        let k = 4u64;
+        let chunk = file_size / k;
+        let mut total_rows = 0usize;
+        for i in 0..k {
+            let start = i * chunk;
+            let length = if i == k - 1 { file_size - start } else { chunk };
+            let reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current()).build();
+            let tasks = Box::pin(futures::stream::iter(
+                vec![Ok(FileScanTask {
+                    file_size_in_bytes: file_size,
+                    start,
+                    length,
+                    record_count: None,
+                    data_file_path: path.clone(),
+                    data_file_format: DataFileFormat::Parquet,
+                    schema: schema.clone(),
+                    project_field_ids: vec![1],
+                    predicate: None,
+                    deletes: vec![],
+                    partition: None,
+                    partition_spec: None,
+                    name_mapping: None,
+                    case_sensitive: false,
+                })]
+                .into_iter(),
+            )) as FileScanTaskStream;
+            let rows: usize = reader
+                .read(tasks)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            eprintln!("split {i} [{start}, {}) -> {rows} rows", start + length);
+            total_rows += rows;
+        }
+        eprintln!("TOTAL across {k} splits = {total_rows} (file has {N})");
+        assert_eq!(
+            total_rows, N as usize,
+            "OVER-READ: {k} byte-range splits of a single-row-group file returned {total_rows} \
+             rows but the file has only {N}. Each split re-read the whole row group."
+        );
+    }
+
     #[test]
     fn test_arrow_projection_mask() {
         let schema = Arc::new(
