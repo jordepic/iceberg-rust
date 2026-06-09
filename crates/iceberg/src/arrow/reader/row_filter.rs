@@ -176,13 +176,22 @@ impl ArrowReader {
 
         for (idx, row_group) in row_groups.iter().enumerate() {
             let row_group_size = row_group.compressed_size() as u64;
-            let row_group_end = current_byte_offset + row_group_size;
 
-            if current_byte_offset < end && start < row_group_end {
+            // Assign each row group to EXACTLY ONE split: the one whose byte range contains the
+            // row group's MIDPOINT. This mirrors parquet-mr's `filterFileMetaDataByMidpoint`, which
+            // iceberg-java drives via `ParquetReadOptions.withRange(start, start + length)`.
+            //
+            // A byte-range *overlap* test (the previous behaviour) instead selects a row group for
+            // EVERY split it spans. Iceberg/Comet plan splits by `read.split.target-size`, which does
+            // not align to row-group boundaries, so a row group larger than the split granularity --
+            // e.g. tables written with a large `write.parquet.row-group-size-bytes` -- overlaps many
+            // splits and is then read once per split, multiplying the row count by the split fan-out.
+            let midpoint = current_byte_offset + row_group_size / 2;
+            if start <= midpoint && midpoint < end {
                 selected.push(idx);
             }
 
-            current_byte_offset = row_group_end;
+            current_byte_offset += row_group_size;
         }
 
         Ok(selected)
