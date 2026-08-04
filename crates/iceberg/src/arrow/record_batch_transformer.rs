@@ -25,7 +25,8 @@ use arrow_array::{
 };
 use arrow_cast::cast;
 use arrow_schema::{
-    DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, SchemaRef,
+    DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    SchemaRef,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
@@ -527,9 +528,18 @@ impl RecordBatchTransformer {
                 //
                 // At this point, all field IDs in the source schema are trustworthy.
                 // No conflict detection needed - schema resolution happened in reader.rs.
+                //
+                // Exact equality, not `equals_datatype`: a nested type owns its child `Field`s, so
+                // child names and metadata are part of the target type. `equals_datatype` ignores
+                // both, so passing the column through would stamp the target schema onto an array
+                // that still carries the file's type -- a batch whose schema disagrees with its own
+                // columns. Readers that rebuild strictly (`RecordBatch::try_new`, as DataFusion's
+                // ProjectionExec does) then reject it. Promoting instead rebuilds the array against
+                // the target's `Field`s, which is O(nesting depth): buffers, offsets and children
+                // are moved, not copied.
                 let field_by_id = field_id_to_source_schema_map.get(field_id).map(
                     |(source_field, source_index)| {
-                        if source_field.data_type().equals_datatype(target_type) {
+                        if source_field.data_type() == target_type {
                             ColumnSource::PassThrough {
                                 source_index: *source_index,
                             }
@@ -639,9 +649,11 @@ fn arrow_field_id(field: &Field) -> Option<i32> {
 /// the types no longer line up -- producing errors like "Casting from Utf8 to Struct".
 ///
 /// This walks the target type recursively instead:
-///   * Struct: for each target child, find the source child with the same field id and recurse;
-///     children present in the target but absent from the source (added by schema evolution) are
-///     filled with all-NULL arrays of the target child type. Source-only children are dropped.
+///   * Struct: for each target child, find the source child with the same field id and recurse,
+///     falling back to a name match against source children that carry no field id at all (files
+///     written without ids); children present in the target but absent from the source (added by
+///     schema evolution) are filled with all-NULL arrays of the target child type. Source-only
+///     children are dropped.
 ///   * List / LargeList / Map: recurse into the element / key / value types, preserving the
 ///     source offsets and validity (row count is unchanged).
 ///   * Anything else (primitives): defer to `arrow_cast::cast` for valid Iceberg type promotions
@@ -661,36 +673,7 @@ fn promote_array_to_target(array: &ArrayRef, target_type: &DataType) -> Result<A
                     ),
                 )
             })?;
-
-            // field id -> source child column index
-            let mut source_by_id: HashMap<i32, usize> = HashMap::new();
-            for (idx, field) in source.fields().iter().enumerate() {
-                if let Some(id) = arrow_field_id(field) {
-                    source_by_id.insert(id, idx);
-                }
-            }
-
-            let len = source.len();
-            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(target_children.len());
-            for target_child in target_children.iter() {
-                let matched = arrow_field_id(target_child)
-                    .and_then(|id| source_by_id.get(&id))
-                    .copied();
-                match matched {
-                    Some(src_idx) => new_columns.push(promote_array_to_target(
-                        source.column(src_idx),
-                        target_child.data_type(),
-                    )?),
-                    // Field added by schema evolution after this file was written -> all NULLs.
-                    None => new_columns.push(new_null_array(target_child.data_type(), len)),
-                }
-            }
-
-            Ok(Arc::new(StructArray::new(
-                target_children.clone(),
-                new_columns,
-                source.nulls().cloned(),
-            )))
+            promote_struct_to_target(source, target_children)
         }
         DataType::List(target_element) => {
             let source = array.as_list_opt::<i32>().ok_or_else(|| list_err(array, target_type))?;
@@ -735,6 +718,47 @@ fn promote_array_to_target(array: &ArrayRef, target_type: &DataType) -> Result<A
         // Primitive (and other leaf) types: standard Iceberg type promotion.
         _ => Ok(cast(array.as_ref(), target_type)?),
     }
+}
+
+/// Rebuild a struct array against the target's children, matching them to the source's by field id.
+fn promote_struct_to_target(source: &StructArray, target_children: &Fields) -> Result<ArrayRef> {
+    // field id -> source child column index, plus a name lookup covering children that carry no
+    // field id. A file written without ids gets them from name mapping or the positional fallback,
+    // neither of which annotates nested children, so an id-only match would treat every child as
+    // absent and NULL out the whole struct.
+    let mut source_by_id: HashMap<i32, usize> = HashMap::new();
+    let mut unidentified_source_by_name: HashMap<&str, usize> = HashMap::new();
+    for (idx, field) in source.fields().iter().enumerate() {
+        if let Some(id) = arrow_field_id(field) {
+            source_by_id.insert(id, idx);
+        } else {
+            unidentified_source_by_name.insert(field.name().as_str(), idx);
+        }
+    }
+
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(target_children.len());
+    for target_child in target_children.iter() {
+        // An id-bearing source child is only ever matched by id: sharing a name with a
+        // differently-identified field does not make it the same field.
+        let matched = arrow_field_id(target_child)
+            .and_then(|id| source_by_id.get(&id))
+            .or_else(|| unidentified_source_by_name.get(target_child.name().as_str()))
+            .copied();
+        match matched {
+            Some(src_idx) => new_columns.push(promote_array_to_target(
+                source.column(src_idx),
+                target_child.data_type(),
+            )?),
+            // Field added by schema evolution after this file was written -> all NULLs.
+            None => new_columns.push(new_null_array(target_child.data_type(), source.len())),
+        }
+    }
+
+    Ok(Arc::new(StructArray::new(
+        target_children.clone(),
+        new_columns,
+        source.nulls().cloned(),
+    )))
 }
 
 fn list_err(array: &ArrayRef, target_type: &DataType) -> Error {
@@ -912,6 +936,115 @@ mod test {
         assert_eq!(ev.len(), 2);
         let first = ev.value(0);
         assert_eq!(first.as_struct().column(0).as_primitive::<arrow_array::types::Int32Type>().value(0), 10);
+    }
+
+    /// A transformed batch must describe its own columns. Iceberg carries a field's `doc` into
+    /// arrow field metadata and parquet does not, and a nested type owns its child `Field`s -- so
+    /// for a `list<struct<..>>` whose children are documented, the table's type and the file's type
+    /// differ *inside the `DataType`*. Passing the column through stamped the target schema onto an
+    /// array that still had the file's type, and any strict rebuilder downstream (DataFusion's
+    /// `ProjectionExec`) then rejected the batch with "column types must match schema types".
+    /// Tables written from a flattened Avro schema hit this on every nested column, because
+    /// iceberg-java's Avro conversion documents every field.
+    #[test]
+    fn documented_nested_fields_keep_batch_schema_and_columns_in_step() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use arrow_array::{ArrayRef, ListArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+        use arrow_schema::Fields;
+
+        use crate::spec::{ListType, StructType};
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "legs",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                3,
+                                Type::Struct(StructType::new(vec![
+                                    NestedField::optional(
+                                        4,
+                                        "leg_id",
+                                        Type::Primitive(PrimitiveType::Long),
+                                    )
+                                    .with_doc("leg identifier")
+                                    .into(),
+                                ])),
+                                true,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // The file's view of the same columns: same field ids, no docs, as parquet stores none.
+        let leg_id_field = with_id(Field::new("leg_id", DataType::Int64, true), 4);
+        let element_field = Arc::new(with_id(
+            Field::new(
+                "element",
+                DataType::Struct(Fields::from(vec![leg_id_field.clone()])),
+                false,
+            ),
+            3,
+        ));
+        let legs = Arc::new(ListArray::new(
+            element_field.clone(),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            Arc::new(StructArray::new(
+                Fields::from(vec![leg_id_field]),
+                vec![Arc::new(Int64Array::from(vec![7, 8])) as ArrayRef],
+                None,
+            )),
+            None,
+        )) as ArrayRef;
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            with_id(Field::new("id", DataType::Int32, false), 1),
+            with_id(Field::new("legs", DataType::List(element_field), true), 2),
+        ]));
+        let file_batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            legs,
+        ])
+        .unwrap();
+
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+        let result = transformer.process_record_batch(file_batch).unwrap();
+
+        let DataType::List(element) = result.schema().field(1).data_type().clone() else {
+            panic!("legs must still be a list");
+        };
+        let DataType::Struct(children) = element.data_type().clone() else {
+            panic!("legs elements must still be structs");
+        };
+        assert!(
+            children[0].metadata().contains_key("doc"),
+            "the doc metadata the file lacks must be present, or this test proves nothing"
+        );
+
+        RecordBatch::try_new(result.schema(), result.columns().to_vec())
+            .expect("a transformed batch must survive a strict rebuild");
+
+        let legs_out = result.column(1).as_list::<i32>();
+        assert_eq!(
+            legs_out
+                .value(0)
+                .as_struct()
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .value(0),
+            7,
+            "values must survive the rebuild"
+        );
     }
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
